@@ -36,17 +36,18 @@
 
 %%%_* Code =============================================================
 %%%_ * Types -----------------------------------------------------------
--record(f, { name      :: list()
-	   , start     :: integer()
-	   , fd        :: _
-	   , size      :: integer()
+-record(f, { name  = throw(name)  :: list()
+	   , start = throw(start) :: integer()
+	   , fd    = throw(fd)    :: _
+	   , size  = 0            :: integer()
 	   }).
 
--record(s, { path      :: list()
-	   , size      :: integer()
-	   , files     :: list()
-	   , min_n     :: integer()
-	   , max_n     :: integer()
+-record(s, { path  = throw(path)  :: list()
+	   , size  = throw(size)  :: integer()
+	   , files = throw(files) :: list()
+	   , min   = 0            :: integer()
+	   , max   = 0            :: integer()
+	   , idx   = dict:new()   :: _
 	   }).
 
 %%%_ * API -------------------------------------------------------------
@@ -64,12 +65,12 @@ read(N) ->
 %% @doc truncate_head(N) -> ok | {error, _}.
 %% remove entry N and everything after it
 truncate_head(N) ->
-  gen_server:call(?MODULE, {truncate, head, N}).
+  gen_server:call(?MODULE, {trunc_head, N}).
 
 %% @doc truncate_tail(N) -> ok | {error, _}.
 %% remove entry N and everything before it
 truncate_tail(N) ->
-  gen_server:call(?MODULE, {truncate, tail, N}).
+  gen_server:call(?MODULE, {trunc_tail, N}).
 
 %%%_ * gen_server callbacks --------------------------------------------
 init([]) ->
@@ -85,33 +86,34 @@ terminate(_Rsn, S) ->
   lists:foreach(fun(F) -> ok = file:close(F#.fd) end, S#s.files).
 
 handle_call({append, Term}, _From, S) ->
-  [F0|Fs]     = maybe_switch_log(S#s.files, S#s.size),
-  {F, Offset} = do_append(S#s.max_n+1, Term, F0),
-  N2O         = update_index(Offset, S#s.max_n+1, S#s.n2o),
-  {reply, {ok, S#s.next}, S#s{files=[F|Fs],
-			      n2o=N2O
-			      max_n=S#s.max_n+1
-			     }};
-
-handle_call({read, N}, _From, S)
-  when N > S#s.max_n;
-       N < S#s.min_n ->
-  {reply, {error, bounds}, S};
+  [F0|Fs]         = maybe_switch_log(S#s.files, S#s.size),
+  {F, Offset}     = append_term(S#s.max, Term, F0),
+  {Idx, Min, Max} = update_idx_append(Offset, S#s.idx, S#s.min, S#s.max),
+  {reply, {ok, N}, S#s{files=[F|Fs],
+		       n2o=N2O
+		       max_n=N
+		      }};
 
 handle_call({read, N}, _From, S) ->
-  {reply, {ok, do_read(dict:fetch(N, S#s.n2o), S#s.files)}, S};
+  case dict:find(N, S#s.n2o) of
+    {value, Offset} -> {reply, {ok, do_read(Offset, S#s.files)}, S};
+    error           -> {reply, {error, notfound}, S}
+  end.
 
-handle_call({truncate, _, N}, _From, S)
-  when N < S#s.min_n;
-       N > S#s.max_n ->
+handle_call({Trunc, N}, _From, S)
+  when Trunc =:= trunc_tail;
+       Trunc =:= trunc_head,
+       (N < S#s.min orelse N > S#s.max ->
   {reply, {error, bounds}, S};
 
-handle_call({truncate, Type, N}, _From, S) ->
-  Fs0 = maybe_switch_log(S#s.files, S#s.size),
-  Fs1 = do_truncate(Fs0, Type, N),
-  Fs  = do_gc(Fs1, Type, N),
-  N20 = update_index(),
-  {reply, ok, S}.
+handle_call({Trunc, N}, _From, S)
+  when Trunc =:= trunc_head;
+       Trunc =:= trunc_tail ->
+  [F0|Fs0]        = maybe_switch_log(S#s.files, S#s.size),
+  F               = append_trunc(Type, N, F0),
+  {Idx, Min, Max} = update_idx_trunc(Type, S#s.idx, S#s.min, S#s.max),
+  Fs              = gc([F|Fs0], Idx, Min, Max),
+  {reply, ok, S#s{files=Fs, idx=Idx, min=Min, max=Max}}.
 
 handle_cast(Msg, S) ->
   {stop, {bad_cast, Msg}, S}.
@@ -122,9 +124,10 @@ handle_info(Msg, S) ->
 
 %%%_ * Internals init --------------------------------------------------
 init_new(Path, Size) ->
-  File = log_filename(Path, 0),
+  File     = log_filename(Path, 0),
   {ok, FD} = file:open(File, [read, write, binary]),
-  {ok, #s{files=[#f{name=File, start=0, fd=FD, size=0}], n2o=dict:new()}}.
+  F        = #f{name=File, start=0, fd=FD},
+  {ok, #s{path=Path, size=Size, files=[F]}}.
 
 init_old(Path, Size, Files) ->
   Fs = lists:map(
@@ -133,17 +136,19 @@ init_old(Path, Size, Files) ->
 	     {ok, #file_info{size=Size}} = file:read_file_info(File),
 	     #f{name=File, start=start_offset(File), fd=FD, size=Size}
 	 end, Files),
-  {N2O, Min, Max} = traverse(Fs, dict:new(), undefined, undefined),
+  {N2O, Min, Max} = traverse(Fs, dict:new(), 0, 0),
   {ok, #s{files=Fs, n2o=N2O}}.
 
-traverse_log([F|Fs], D, Min, Max) ->
+traverse_log([F|Fs], D0, Min0, Max0) ->
   case read_next(F) of
     {ok, {entry, N, Offset}} ->
-      read_next([F|Fs], dict:store(N, Offset, D), Min, Max+1);
-    {ok, {trunc_tail, N}} ->
-      read_next([F|Fs], D, N, Max);
-    {ok, {trunc_head, N}} ->
-      read_next([F|Fs], D, Min, N);
+      {D, Min, Max} = update_idx_append(Offset, N, D0, Min0, Max0),
+      read_next([F|Fs], D, Min, Max);
+    {ok, {Trunc, N}}
+      when Trunc =:= trunc_head;
+	   Trunc =:= trunc_tail ->
+      {D, Min, Max} = update_idx_trunc(Trunc, D0, Min0, Max0),
+      read_next([F|Fs], D, Min, Max);
     {error, eof}   when Fs =:= [] -> {D, Min, Max};
     {error, short} when Fs =:= [] -> {D, Min, Max}
   end.
@@ -174,18 +179,38 @@ read_next_parse(<<?entry_trunc_tail, N:64/integer>>) ->
   {trunc_tail, N}.
 
 %%%_ * Internals append ------------------------------------------------
-do_append(N, Term, #f{size=Size}) ->
+append_term(N, Term, #f{size=Size}) ->
   TermBin   = erlang:term_to_binary(Term),
   EntryBin  = <<?entry_log, N:64/integer, TermBin/binary>>,
   write_log(EntryBin, F).
 
-%%%_ * Internals truncate ----------------------------------------------
-do_truncate(N) ->
-  EntryBin  = <<?entry_trunc_head, N:64/integer>>,
-  EntrySize = erlang:size(EntryBin),
-  Hash      = crypto:sha(EntryBin),
-  write_log(<<?entry_trunc_head, N:64/integer>>).
+append_trunc(Trunc, N, F) ->
+  EntryBin  = <<a2m(Trunc), N:64/integer>>,
+  write_log(EntryBin, F).
 
+write_log(Bin, F) ->
+  Size = erlang:size(Bin),
+  Hash = crypto:sha(Bin),
+  ok = file:pwrite(F#f.fd, F#f.size, <<Hash/binary,
+				       Size:64/integer,
+				       Bin/binary>>),
+  F#f{size = F#f.size + 20 + 8 + Size}.
+
+a2m(trunc_head) -> ?entry_trunc_head;
+a2m(trunc_tail) -> ?entry_trunc_tail.
+
+%%%_ * Internals gc ----------------------------------------------------
+gc(Files, Idx, Min, Max) ->
+  Files.
+
+%%%_ * Internals index -------------------------------------------------
+update_idx_append(Offset, Idx, Min, Max) ->
+  {dict:store(Max+1, Offset, Idx), Min, Max+1}.
+
+update_idx_trunc(Trunc, N, Idx, Min, Max) ->
+  %% remove mappings from Idx.
+  %% update min/max
+  Idx.
 
 %%%_ * Internals misc --------------------------------------------------
 maybe_switch_log([#f{size=Size}|_] = Files, MaxSize)
@@ -197,13 +222,6 @@ maybe_switch_log([F|_] = Files, _MaxSize) ->
   {ok, FD} = file:open(File, [read, write, binary]),
   [#f{name=File, start=Start, fd=FD, size=0} | Files].
 
-write_log(Bin, F) ->
-  Size = erlang:size(Bin),
-  Hash = crypto:sha(Bin),
-  ok = file:pwrite(F#f.fd, F#f.size, <<Hash/binary,
-				       Size:64/integer,
-				       Bin/binary>>),
-  F#f{size = F#f.size + 20 + 8 + Size}.
 
 log_filename(Path, Offset) ->
   File = lists:flatten(io_lib:format("~20..0B", [Offset])),
