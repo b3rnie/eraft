@@ -45,8 +45,8 @@
 -record(s, { path  = throw(path)  :: list()
 	   , size  = throw(size)  :: integer()
 	   , files = throw(files) :: list()
-	   , min   = 0            :: integer()
-	   , max   = 0            :: integer()
+	   , min   = 1            :: integer()
+	   , next  = 1            :: integer()
 	   , idx   = dict:new()   :: _
 	   }).
 
@@ -86,16 +86,17 @@ terminate(_Rsn, S) ->
   lists:foreach(fun(F) -> ok = file:close(F#.fd) end, S#s.files).
 
 handle_call({append, Term}, _From, S) ->
-  [F0|Fs]         = maybe_switch_log(S#s.files, S#s.size),
-  {F, Offset}     = append_term(S#s.max, Term, F0),
-  {Idx, Min, Max} = update_idx_append(Offset, S#s.idx, S#s.min, S#s.max),
-  {reply, {ok, N}, S#s{files=[F|Fs],
-		       n2o=N2O
-		       max_n=N
-		      }};
+  [F0|Fs]          = maybe_switch_log(S#s.files, S#s.size),
+  {F, Offset}      = append_term(Term, F0, S#s.next),
+  {Idx, Min, Next} = update_idx_append(Offset, S#s.idx, S#s.min, S#s.next),
+  {reply, {ok, S#s.next}, S#s{ files = [F|Fs]
+			     , idx   = Idx
+			     , min   = Min
+			     , next  = Next
+			     }};
 
 handle_call({read, N}, _From, S) ->
-  case dict:find(N, S#s.n2o) of
+  case dict:find(N, S#s.idx) of
     {value, Offset} -> {reply, {ok, do_read(Offset, S#s.files)}, S};
     error           -> {reply, {error, notfound}, S}
   end.
@@ -109,10 +110,10 @@ handle_call({Trunc, N}, _From, S)
 handle_call({Trunc, N}, _From, S)
   when Trunc =:= trunc_head;
        Trunc =:= trunc_tail ->
-  [F0|Fs0]        = maybe_switch_log(S#s.files, S#s.size),
-  F               = append_trunc(Type, N, F0),
-  {Idx, Min, Max} = update_idx_trunc(Type, S#s.idx, S#s.min, S#s.max),
-  Fs              = gc([F|Fs0], Idx, Min, Max),
+  [F0|Fs0]         = maybe_switch_log(S#s.files, S#s.size),
+  F                = append_trunc(Type, F0, N),
+  {Idx, Min, Next} = update_idx_trunc(Type, S#s.idx, S#s.min, S#s.next),
+  Fs               = gc([F|Fs0], Idx, Min, Next),
   {reply, ok, S#s{files=Fs, idx=Idx, min=Min, max=Max}}.
 
 handle_cast(Msg, S) ->
@@ -179,10 +180,10 @@ read_next_parse(<<?entry_trunc_tail, N:64/integer>>) ->
   {trunc_tail, N}.
 
 %%%_ * Internals append ------------------------------------------------
-append_term(N, Term, #f{size=Size}) ->
+append_term(Term, F, N) ->
   TermBin   = erlang:term_to_binary(Term),
   EntryBin  = <<?entry_log, N:64/integer, TermBin/binary>>,
-  write_log(EntryBin, F).
+  {write_log(EntryBin, F), F#f.start+F#f.size}.
 
 append_trunc(Trunc, N, F) ->
   EntryBin  = <<a2m(Trunc), N:64/integer>>,
@@ -207,10 +208,15 @@ gc(Files, Idx, Min, Max) ->
 update_idx_append(Offset, Idx, Min, Max) ->
   {dict:store(Max+1, Offset, Idx), Min, Max+1}.
 
-update_idx_trunc(Trunc, N, Idx, Min, Max) ->
-  %% remove mappings from Idx.
-  %% update min/max
-  Idx.
+update_idx_trunc(trunc_tail, N, Idx, Min, Max) ->
+  {remove_range(Min, N, Idx), N+1, Max};
+update_idx_trunc(trunc_head, N, Idx, Min, Max) ->
+  {remove_range(N, Max), Min, N-1}.
+
+remove_range(From, To, Idx) ->
+  lists:foldl(fun(N, D) ->
+		  dict:erase(N, D)
+	      end, Idx, lists:seq(From, To)).
 
 %%%_ * Internals misc --------------------------------------------------
 maybe_switch_log([#f{size=Size}|_] = Files, MaxSize)
