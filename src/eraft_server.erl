@@ -7,7 +7,7 @@
 
 %%%_* Module declaration ===============================================
 -module(eraft_server).
--behaviour(gen_server).
+-behaviour(gen_fsm).
 
 %%%_* Exports ==========================================================
 -export([ start_link/0
@@ -28,191 +28,305 @@
 %%%_* Macros ===========================================================
 %%%_* Code =============================================================
 %%%_ * Types -----------------------------------------------------------
--record(s, {
-           %% common
-             role  = follower :: leader | candidate | follower
-           , term  = 1        :: integer()
-           , id               :: node()
-	   , tref             :: _
-           , nodes            :: list()
-           %% follower
-	   , vote             :: undefined | integer()
-           , leader           :: node()
-           %% leader
-           , request          :: any()
-           , next_index       :: list()
-           , call             :: any()
-           }).
+-record(s,
+        { %% common
+        , term  = 1        :: integer()
+        , id               :: node()
+        , tref             :: _
+        , nodes            :: list()
+          %% follower
+        , vote             :: undefined | integer()
+        , leader           :: node()
+          %% leader
+        , request          :: any()
+        , next_index       :: list()
+        , call             :: any()
+        }).
 
--record(rv, { term           :: integer()
-            , id             :: node()
-            , last_log_idx   :: integer()
-            , last_log_term  :: integer()
-            }).
+-record(request_vote_req,
+        { term           = throw('term')          :: integer()
+        , id             = throw('id')            :: node()
+        , last_log_idx   = throw('last_log_idx')  :: integer()
+        , last_log_term  = throw('last_log_term') :: integer()
+        }).
 
--record(ae, { term           :: integer()
-            , id             :: node()
-            , prev_log_idx   :: integer()
-            , prev_log_term  :: integer()
-            , entries        :: list()
-            , commit_idx     :: integer()
-            }).
+-record(request_vote_resp,
+        { id             = throw('id')
+        , term           = throw('term')
+        , granted        = throw('granted')
+        }).
 
--record(resp, {uuid, id, data}).
+-record(append_entries_req,
+        { term           :: integer()
+        , id             :: node()
+        , prev_log_idx   :: integer()
+        , prev_log_term  :: integer()
+        , entries        :: list()
+        , commit_idx     :: integer()
+        }).
+
+-record(append_entries_resp,
+        { id            = throw('id')
+        , term          = throw('term')
+        , success       = throw('success')
+        }).
 
 %%%_ * API -------------------------------------------------------------
 start_link() ->
-  gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+  gen_fsm:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-append(Msg) ->
-  gen_server:call(?MODULE, {append, Msg}).
+append(Entry) ->
+  gen_fsm:sync_send_event(?MODULE, {append, Entry}).
 
-%%%_ * gen_server callbacks --------------------------------------------
+%%%_ * gen_fsm callbacks -----------------------------------------------
 init([]) ->
   {ok, ID}    = application:get_env(eraft, id),
   {ok, Nodes} = application:get_env(eraft, nodes),
   NextIndex   = [{Node, 1} || Node <- Nodes],
-  S           = #s{id=ID, nodes=Nodes, next_index=NextIndex},
-  {ok, reset_timeout(S)}.
+  {ok, follower, #s{id=ID, nodes=Nodes, next_index=NextIndex, tref=reset_timeout(undefined)}}.
 
-handle_call({append, Msg}, From, #s{role=leader} = S) ->
-  {reply, ok, S};
+terminate(_Rsn, _Sn, _S) ->
+  ok.
 
-handle_call({append, Msg}, From, S) ->
-  {reply, {error, {leader, S#s.leader}}, S};
+handle_event(stop, _Sn, S) ->
+  {stop, normal, S};
+handle_event(Msg, _Sn, S) ->
+  {stop, {error, {bad_event, Msg}}, S}.
 
-handle_call(stop, _From, S) ->
-  {stop, normal, ok, S}.
+handle_sync_event(Msg, _From, _Sn, S) ->
+  {stop, {error, {bad_event, Msg}}, S}.
 
-handle_cast(Msg, S) ->
-  {stop, {bad_cast, Msg}, S}.
+handle_info(Msg, Sn, S) ->
+  ?warning("~p", [Msg]),
+  {next_state, Sn, S}.
 
-%% rv stale
-handle_info(#rv{term=Term} = RV, #s{term=CurrentTerm} = S)
+%%%_ * gen_fsm states --------------------------------------------------
+
+%% stale
+follower(#request_vote_req{term=Term, id=ID}, #s{term=CurrentTerm} = S)
   when Term < CurrentTerm ->
-  {noreply, S};
+  send(#request_vote_resp{id=S#s.id, granted=false, term=CurrentTerm}, ID),
+  {next_state, follower, S};
 
-%% rv same/bigger term
-handle_info(#rv{} = RV, #s{term=CurrentTerm} = S0) ->
-  S1 = rv_maybe_stepdown(RV#rv.term, S0),
-  S2 = maybe_change_term(RV#rv.term, S1),
-  S3 = rv_maybe_grant(RV, S2),
-  S  = reset_timeout(S3),
-  {noreply, S}
+%% resend vote
+follower(#request_vote_req{term=Term, id=ID} = R, #s{term=Term, vote=ID} = S) ->
+  ?hence(has_complete_log(R#request_vote_req.last_log_idx,
+                          R#request_vore_req.last_log_term)),
+  send(#request_vote_resp{id=S#s.id, granted=true, term=Term}, ID),
+  {next_state, follower, S#s{tref=election_timeout(S#s.tref)}};
 
-%% ae stale
-handle_info(#ae{term=Term} = AE, #s{term=CurrentTerm} = S)
-  when Term < CurrentTerm ->
-  ?debug("received stale request from ~p", [ID]),
-  {noreply, S};
+%% already voted
+follower(#request_vote_req{term=Term, id=ID} = R, #s{term=Term, vote=Vote} = S)
+  when Vote =/= undefined ->
+  send(#request_vote_resp{id=S#s.id, granted=false, term=Term}, ID),
+  {next_state, follower, S};
 
-%% ae same/bigger term
-handle_info(#ae{} = AE, S0) ->
-  S1 = maybe_change_term(AE#ae.term, S0),
-  S2 = ae_stepdown(S1),
-  S3 = reset_timeout(S2),
-  S  = ae_try_append(AE, S3),
-  {noreply, S}.
-
-%% response stale
-handle_info(#resp{} = R, S)
-  when R#resp.uuid =/= S#s.call_uuid ->
-  {noreply, S};
-
-handle_info(#resp{} = R, S) ->
-  
-  {noreply, S}.
-
-%% heartbeat
-handle_info(timeout, #s{role=leader}, S) ->
-  AE = #ae{ term          = S#s.term
-          , id            = S#s.id
-          , prev_log_idx  = undefined
-          , last_log_idx  = undefined
-          , prev_log_term = undefined
-          , entries       = []
-          , commit_idx    = undefined},
-  broadcast(AE, S#s.nodes),
-  {noreply, S};
-
-handle_info(timeout, #s{role=Role} = S)
-  when Role =:= follower;
-       Role =:= candidate ->
-  S1 = S0#s{term=S0#s.term+1}, %increase current term
-  S2 = S1#s{role=candidate},   %transition to candidate
-  S3 = reset_timeout(S2),
-  S  = election_start(S3),
-  {noreply, S}.
-
-%%%_ * Internals request vote ------------------------------------------
-rv_maybe_stepdown(Term, #s{term=CurrentTerm})
-  when Term > CurrentTerm,
-       (S#s.role =:= candidate orelse
-        S#s.role =:= leader) ->
-  S#s{role=follower};
-rv_maybe_stepdown(#rv{}, S) ->
-  S.
-
-rv_maybe_grant(#rv{id=ID}, S#s{vote=Vote})
-  when Vote =/= undefined,
-       Vote =/= ID ->
-  ?debug("~p: already voted", [S#s.term]),
-  S;
-rv_maybe_grant(#rv{term=Term, id=ID}, S) ->
-  case
-    (RV#rv.last_log_term > last_log_term()) orelse
-    (RV#rv.last_log_term =:= last_log_term() andalso
-     RV#rv.last_log_idx >= last_log_index()) of
-    true ->
-      ?debug("~p: granting vote to ~p", [S#s.term, ID]),
-      send(
-      S#s{vote=ID, tref=reset_timeout(S#s.tref)};
-    false ->
-      ?debug("~p: denying vote to ~p", [S#s.term, ID]),
-      S
-  end.
-
-%%%_ * Internals append entries ----------------------------------------
-ae_stepdown(#s{role=leader} = S)    -> S#s{role=follower};
-ae_stepdown(#s{role=candidate} = S) -> S#s{role=follower};
-ae_stepdown(#s{role=follower} = S)  -> S.
-
-ae_try_append(#ae{} = AE, S) ->
-  case log_contains_entry(PrevLogIdx, PrevLogTerm) of
-    false ->
-      S
+%% can vote
+follower(#request_vote_req{term=Term, id=ID} = R, S) ->
+  case has_complete_log(R#request_vote_req.last_log_idx,
+                        R#request_vote_req.last_log_term) of
     true  ->
-      delete_conflicting_entries(Entries),
-      append_new_entries(Entries),
-      S
-  end.
+      send(#request_vote_resp{id=S#s.id, granted=false, term=Term}, ID),
+      {next_state, follower, S#s{term=Term, vote=ID, tref=election_timeout(S#s.tref)}};
+    false ->
+      send(#request_vote_resp{id=S#s.id, granted=false, term=Term}, ID),
+      {next_state, follower, S#s{term=Term, vote=undefined}}
+  end;
 
-%%%_ * Internals election ----------------------------------------------
-election_start(S) ->
-  RV = #rv{term=S#s.term,
-           id=S#s.id,
-           last_log_idx = undefined,
-           last_log_term=undefinded},
-  broadcast(RV, S#s.nodes),
-  S.
+%% stale
+follower(#append_entries_req{term=Term, id=ID}, #s{term=CurrentTerm} = S)
+  when Term < CurrentTerm ->
+  send(#append_entries_resp{id=S#s.id, term=CurrentTerm, success=false}, ID),
+  {next_state, follower, S};
 
-%%%_ * Internals misc --------------------------------------------------
-reset_timeout(S) ->
-  [{ok, cancel} = timer:cancel(TRef) || S#s.tref =/= undefined],
-  {ok, TRef} = timer:send_after(timeout, eraft_util:random(150, 300)),
-  S#s{tref=TRef}.
+%% can append
+follower(#append_entries_req{term=Term, id=ID}, #s{term=CurrentTerm} = S) ->
+  TRef = election_timeout(S#s.tref),
+  Vote = case Term > CurrentTerm of
+           true  -> undefined;
+           false -> S#s.vote
+         end,
+  case has_entry() of
+    true ->
+      %% delete conflicting
+      %% append
+      send(#append_entries_resp{id=S#s.id, term=Term, success=true}, ID),
+      {next_state, follower, S#s{term=Term, vote=Vote, tref=TRef}};
+    false ->
+      send(#append_entries_resp{id=S#s.id, term=Term, success=false}, ID),
+      {next_state, follower, S#s{term=Term, vote=Vote, tref=TRef}}
+  end;
 
-maybe_change_term(Term, #s{term=CurrentTerm})
-  when Term > CurrentTerm ->
-  S#s{term=Term, vote=undefined};
-maybe_change_term(_, S) ->
-  S.
+%% stale
+follower(#request_vote_resp{}, S) ->
+  {next_state, follower, S};
+
+%% stale
+follower(#append_entries_resp{}, S) ->
+  {next_state, follower, S}.
+
+%% start election
+follower({timeout, Ref, _Msg} #s{tref=Ref, other=Nodes} = S) ->
+  Term = S#s.term+1,
+  Req = #request_vote_req{id=S#s.id, term=Term,
+                          last_log_idx=eraft_log:last_log_idx(),
+                          last_log_term=eraft_log:last_log_term()},
+  broadcast(Req, Nodes),
+  {next_state, candidate, S#s{term=S#s.term+1, vote=S#s.id, tref=election_timeout(S#s.tref)}}.
+
+%% stale
+candidate(#request_vote_req{term=Term, id=ID}, #s{term=CurrentTerm} = S)
+  when Term < CurrentTerm ->
+  send(#request_vote_resp{id=S#s.id, term=CurrentTerm, granted=false}, ID),
+  {next_state, candidate, S};
+
+%% someone else tries to become leader aswell
+candidate(#request_vote_req{term=Term, id=ID}, #s{term=Term, vote=Vote} = S) ->
+  ?hence(S#s.id =:= S#s.vote),
+  send(#request_vote_resp{id=S#s.id, term=Term, granted=false}, ID),
+  {next_state, candidate, S};
+
+%% stepdown
+candidate(#request_vote_req{term=Term, id=ID}, S) ->
+  case has_complete_log(R#request_vote_req.last_log_idx,
+                        R#request_vote_req.last_log_term) of
+    true ->
+      send(#request_vote_resp{id=S#s.id, term=Term, granted=true}, ID),
+      {next_state, follower, S#s{term=Term, vote=ID, tref=election_timeout(S#s.tref)}};
+    false ->
+      send(#request_vote_resp{id=S#s.id, term=Term, granted=false}, ID),
+      {next_state, follower, S#s{term=Term, vote=undefined}}
+  end;
+
+%% stale
+candidate(#append_entries{term=Term, id=ID}, #s{term=CurrentTerm} = S)
+  when Term < CurrentTerm ->
+  send(#append_entries_resp{id=S#s.id, term=CurrentTerm, success=false}, ID),
+  {next_state, candidate, S};
+
+candidate(#append_entries{term=Term}, #s{term=CurrentTerm} = S) ->
+  TRef = election_timeout(S#s.tref),
+  Vote =
+    case Term > CurrentTerm of
+      true  -> undefined;
+      false -> S#s.vote
+    end,
+  case has_entry(R) of
+    true ->
+      %% delete conflicting
+      %% append
+      send(#append_entries_resp{id=S#s.id, term=Term, success=true}, ID),
+      {next_state, follower, S#s{term=Term, vote=Vote, tref=TRef}};
+    false ->
+      send(#append_entries_resp{id=S#s.id, term=Term, success=false}, ID),
+      {next_state, follower, S#s{term=Term, vote=Vote, tref=TRef}}
+  end;
+
+%% stale
+candidate(#request_vote_resp{term=Term}, #s{term=CurrentTerm} = S)
+  when Term < CurrentTerm ->
+  {next_state, candidate, S}.
+
+%% wait for majority
+candidate(#request_vote_resp{}, S) ->
+  {next_state, candidate, S};
+
+%% stale
+candidate(#append_entries_resp{}, S) ->
+  {next_state, candidate, S};
+
+%% start new election
+candidate({timeout, Ref, _Msg}, #s{tref=Ref} = S) ->
+  Term = S#s.term+1,
+  Req = #request_vote_req{id=S#s.id, term=Term,
+                          last_log_idx=eraft_log:last_log_idx(),
+                          last_log_term=eraft_log:last_log_term()},
+  broadcast(Req, S#s.nodes),
+  %% TODO: broadcast request_vote
+  {next_state, candidate, S#s{term=S#s.term+1, vote=S#s.id, tref=election_timeout(S#s.tref)}}.
+
+%% stale
+leader(#request_vote_req{term=Term, id=ID}, #s{term=CurrentTerm} = S)
+  when Term < CurrentTerm ->
+  send(#request_vote_resp{id=S#s.id, term=CurrentTerm, granted=false}, ID),
+  {next_state, leader, S};
+
+%% someone else tried to become leader
+leader(#request_vote_req{term=Term, id=ID}, #s{term=Term} = S) ->
+  ?hence(S#s.id =:= S#s.vote),
+  send(#request_vote_resp{id=S#s.id, term=Term, granted=false}, ID),
+  {next_state, leader, S}.
+
+%% stepdown
+leader(#request_vote_req{term=Term, id=ID} = R, S) ->
+  case has_complete_log(R#request_vote_req.last_log_idx,
+                        R#request_vote_req.last_log_term) of
+    true ->
+      send(#request_vote_resp{id=S#s.id, term=Term, granted=true}, ID),
+      {next_state, follower, S#s{term=Term, vote=ID, tref=election_timeout(S#s.tref)}};
+    false ->
+      send(#request_vote_resp{id=S#s.id, term=Term, granted=false}, ID),
+      {next_state, follower, S#s{term=Term, vote=undefined}}
+  end;
+
+leader(#append_entries_req{term=Term}, #s{term=CurrentTerm} = S) ->
+  TRef = election_timeout(S#s.tref),
+  Vote =
+    case Term > CurrentTerm of
+      true  -> undefined;
+      false -> S#s.vote
+    end,
+  case has_entry(R) of
+    true ->
+      %% delete conflicting
+      %% append
+      send(#append_entries_resp{id=S#s.id, term=Term, success=true}, ID),
+      {next_state, follower, S#s{term=Term, vote=Vote, tref=TRef}};
+    false ->
+      send(#append_entries_resp{id=S#s.id, term=Term, success=false}, ID),
+      {next_state, follower, S#s{term=Term, vote=Vote, tref=TRef}}
+  end;
+
+%% stale
+leader(#request_vote_resp{}, S) ->
+  {next_state, leader, S};
+
+leader(#append_entries_resp{}, S) ->
+  {next_state, leader, S};
+
+leader({timeout, Ref, _Msg}, #s{tref=Ref} = S) ->
+  %% broadcast heartbeat
+  Req = #append_entries_req{ term = S#s.term
+                           , id   = S#s.id
+                           },
+  broadcast(Req, S#s.other),
+  {next_state, leader, S#s{tref=heartbeat_timeout(S#s.tref)}}.
+
+%%%_ * Internals -------------------------------------------------------
+has_complete_log(LastLogIdx, LastLogTerm) ->
+  LocalLastLogTerm = eraft_log:last_log_term(),
+  LocalLastLogIdx  = eraft_log:last_log_idx(),
+  (LastLogTerm > LocalLastLogTerm)
+    orelse
+      (LastLogTerm =:= LocalLastLogTerm andalso
+       LastLogIdx >= LocalLastLogIdx).
+
+has_entry(PrevLogIdx, PrevLogTerm) ->
+  ok.
+
+heartbeat_timeout(TRef) ->
+  [gen_fsm:cancel_timer(TRef) || TRef =/= undefined],
+  gen_fsm:start_timer(eraft_util:random(150, 300), meh).
+
+election_timeout(TRef) ->
+  [gen_fsm:cancel_timer(TRef) || TRef =/= undefined],
+  gen_fsm:start_timer(eraft_util:random(500, 900), meh).
 
 broadcast(Msg, Nodes) ->
   lists:foreach(fun(N) -> send(Msg, N) end, Nodes).
 
-send(Msg, Node) ->
-  {?MODULE, Node} ! Msg.
+send(Msg, ID) ->
+  gen_fsm:send_event(ID, Msg).
 
 %%%_* Emacs ============================================================
 %%% Local Variables:
