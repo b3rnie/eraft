@@ -10,6 +10,7 @@
 %%%_* Exports ==========================================================
 -export([ random/2
 	, ensure_path/1
+        , quorum/1
         ]).
 
 %%%_ * API -------------------------------------------------------------
@@ -18,6 +19,9 @@ random(From, To) when From >=0, To >=0, From =< To ->
 
 ensure_path(Path) ->
   filelib:ensure_dir(filename:join([Path, "dummy"])).
+
+quorum(N) ->
+  erlang:trunc(N/2)+1.
 
 %%%_* Tests ============================================================
 -ifdef(TEST).

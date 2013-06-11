@@ -1,0 +1,5 @@
+TODO:
+
+Finish basic system
+Tests crash nodes and see that system behaves correctly
+Move data traffic from erlang distribution proto to gen_tcp.
